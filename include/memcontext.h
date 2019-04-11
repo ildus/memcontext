@@ -28,6 +28,7 @@ int mcxt_reset(MemoryContext context, bool recursive);
 int mcxt_delete(MemoryContext context);
 void *mcxt_alloc_mem(MemoryContext context, size_t size, bool zero);
 void mcxt_free_mem(MemoryContext context, void *p);
+int mcxt_chunks_count(MemoryContext context);
 
 static inline void *mcxt_alloc(size_t size)
 {

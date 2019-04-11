@@ -13,10 +13,12 @@
 #include "memutils.h"
 
 static volatile int free_called = 0;
-void __wrap_malloc_free(void *ptr)
+
+void __real_free(void *ptr);
+void __wrap_free(void *ptr)
 {
 	free_called += (int) mock();
-	(void) ptr;
+	__real_free(ptr);
 }
 
 static void test_consistency(void **state) {
@@ -48,16 +50,6 @@ static void test_consistency(void **state) {
 	assert_ptr_equal(child2->nextchild, NULL);
 	assert_ptr_equal(child2->prevchild, child1);
 	assert_ptr_equal(child2->lastchunk, NULL);
-
-	assert_ptr_equal(top->lastchunk->context, top);
-	assert_ptr_equal(top->lastchunk->prev->context, top);
-	assert_ptr_equal(top->lastchunk->chunk_type, mct_context);
-	assert_ptr_equal(top->lastchunk->prev->chunk_type, mct_context);
-	assert_ptr_equal(top->lastchunk, GetMemoryChunk(child2));
-	assert_ptr_equal(top->lastchunk->next, NULL);
-	assert_ptr_equal(top->lastchunk->prev, GetMemoryChunk(child1));
-	assert_ptr_equal(top->lastchunk->prev->next, GetMemoryChunk(child2));
-	assert_ptr_equal(top->lastchunk->prev->prev, NULL);
 
 	old = mcxt_switch_to(old);
 	assert_ptr_equal(old, top);
@@ -99,15 +91,193 @@ static void test_allocation(void **state) {
 	for (int i = 0; i < 10; i++)
 		assert_true(block3[i] == '\0');
 
-	will_return(malloc_free, 1);
+	will_return_always(__wrap_free, 1);
+	free_called = 0;
+
 	mcxt_reset(top, false);
 	assert_ptr_equal(top->lastchunk, NULL);
 	assert_int_equal(free_called, 3);
+
+	mcxt_delete(top);
+	assert_int_equal(free_called, 4);
+
+	(void) state;	/* keep compiler quiet */
+}
+
+static void test_tree_deletion(void **state) {
+	MemoryContext	top = mcxt_new(NULL),
+					old,
+					child1 = mcxt_new(top),
+					child2 = mcxt_new(top),
+					child1_1 = mcxt_new(child1),
+					child1_2 = mcxt_new(child1),
+					child2_1 = mcxt_new(child2);
+
+	will_return_always(__wrap_free, 1);
+	free_called = 0;
+	mcxt_delete(top);
+	assert_int_equal(free_called, 6);
+
+	(void) state;	/* keep compiler quiet */
+}
+
+static void test_part_tree_deletion(void **state) {
+	MemoryContext	top = mcxt_new(NULL),
+					child1,
+					child1_1,
+					child2,
+					child2_1,
+					child2_2,
+					child2_3,
+					child2_1_1,
+					child2_1_2,
+					child3;
+
+	will_return_always(__wrap_free, 1);
+
+	assert_ptr_equal(top->firstchild, NULL);
+	assert_ptr_equal(top->nextchild, NULL);
+	assert_ptr_equal(top->prevchild, NULL);
+	assert_ptr_equal(top->parent, NULL);
+
+	child1 = mcxt_new(top);
+	assert_ptr_equal(top->firstchild, child1);
+	assert_ptr_equal(child1->firstchild, NULL);
+	assert_ptr_equal(child1->nextchild, NULL);
+	assert_ptr_equal(child1->prevchild, NULL);
+	assert_ptr_equal(child1->parent, top);
+
+	child1_1 = mcxt_new(child1);
+	assert_ptr_equal(child1->firstchild, child1_1);
+	assert_ptr_equal(child1->nextchild, NULL);
+	assert_ptr_equal(child1->prevchild, NULL);
+	assert_ptr_equal(child1->parent, top);
+
+	assert_ptr_equal(child1_1->firstchild, NULL);
+	assert_ptr_equal(child1_1->nextchild, NULL);
+	assert_ptr_equal(child1_1->prevchild, NULL);
+	assert_ptr_equal(child1_1->parent, child1);
+
+	child2 = mcxt_new(top);
+	assert_ptr_equal(top->firstchild, child1);
+	assert_ptr_equal(child2->firstchild, NULL);
+	assert_ptr_equal(child2->nextchild, NULL);
+	assert_ptr_equal(child2->prevchild, child1);
+	assert_ptr_equal(child2->parent, top);
+
+	assert_ptr_equal(child1->nextchild, child2);
+	assert_ptr_equal(child1->prevchild, NULL);
+	assert_ptr_equal(child1->parent, top);
+
+	free_called = 0;
+	mcxt_delete(child1_1);
+	assert_int_equal(free_called, 1);
+	assert_ptr_equal(child1->firstchild, NULL);
+
+	child2_1 = mcxt_new(child2);
+	child2_2 = mcxt_new(child2);
+	child2_3 = mcxt_new(child2);
+	child2_1_1 = mcxt_new(child2_1);
+	child2_1_2 = mcxt_new(child2_1);
+
+	child3 = mcxt_new(top);
+
+	assert_ptr_equal(child2_1->prevchild, NULL);
+	assert_ptr_equal(child2_1->nextchild, child2_2);
+	assert_ptr_equal(child2_2->prevchild, child2_1);
+	assert_ptr_equal(child2_2->nextchild, child2_3);
+	assert_ptr_equal(child2_3->prevchild, child2_2);
+	assert_ptr_equal(child2_3->nextchild, NULL);
+	assert_ptr_equal(child2_1->firstchild, child2_1_1);
+
+	free_called = 0;
+	mcxt_delete(child2);
+
+	assert_ptr_equal(top->firstchild, child1);
+	assert_ptr_equal(child1->nextchild, child3);
+	assert_ptr_equal(child1->prevchild, NULL);
+
+	assert_ptr_equal(child3->prevchild, child1);
+	assert_ptr_equal(child3->nextchild, NULL);
+
+	assert_int_equal(free_called, 6);
+
+	(void) state;	/* keep compiler quiet */
+}
+
+static void test_reset(void **state) {
+	MemoryContext	top = mcxt_new(NULL),
+					child1 = mcxt_new(top),
+					child2 = mcxt_new(top),
+					old;
+
+	free_called = 0;
+	will_return_always(__wrap_free, 1);
+
+	old = mcxt_switch_to(top);
+	mcxt_alloc(10);
+	mcxt_alloc(10);
+	mcxt_alloc(10);
+	mcxt_switch_to(old);
+
+	old = mcxt_switch_to(child1);
+	mcxt_alloc(10);
+	mcxt_alloc(10);
+	mcxt_switch_to(old);
+
+	old = mcxt_switch_to(child2);
+	mcxt_alloc(10);
+	mcxt_switch_to(old);
+
+	assert_int_equal(mcxt_chunks_count(top), 3);
+	assert_int_equal(mcxt_chunks_count(child1), 2);
+	assert_int_equal(mcxt_chunks_count(child2), 1);
+
+	mcxt_reset(top, false);
+	assert_int_equal(mcxt_chunks_count(top), 0);
+	assert_int_equal(mcxt_chunks_count(child1), 2);
+	assert_int_equal(mcxt_chunks_count(child2), 1);
+
+	mcxt_reset(top, true);
+	assert_int_equal(mcxt_chunks_count(top), 0);
+	assert_int_equal(mcxt_chunks_count(child1), 0);
+	assert_int_equal(mcxt_chunks_count(child2), 0);
+	assert_int_equal(free_called, 6);
 
 	(void) state;	/* keep compiler quiet */
 }
 
 static void test_helpers(void **state) {
+	MemoryContext	top = mcxt_new(NULL),
+					child1 = mcxt_new(top),
+					old;
+	MemoryChunk		chunk1,
+					chunk2;
+
+	will_return_always(__wrap_free, 1);
+
+	mcxt_switch_to(top);
+	chunk1 = GetMemoryChunk(mcxt_alloc(10));
+	assert_ptr_equal(chunk1->context, top);
+
+	old = mcxt_switch_to(child1);
+	assert_ptr_equal(old, top);
+	chunk2 = GetMemoryChunk(mcxt_alloc0(10));
+	assert_ptr_equal(chunk2->context, child1);
+	old = mcxt_switch_to(old);
+	assert_ptr_equal(old, child1);
+
+	assert_int_equal(mcxt_chunks_count(top), 1);
+	assert_int_equal(mcxt_chunks_count(child1), 1);
+
+	free_called = 0;
+	mcxt_free(ChunkDataOffset(chunk1));
+	mcxt_free(ChunkDataOffset(chunk2));
+
+	assert_int_equal(free_called, 2);
+	assert_int_equal(mcxt_chunks_count(top), 0);
+	assert_int_equal(mcxt_chunks_count(child1), 0);
+
 	(void) state;	/* keep compiler quiet */
 }
 
@@ -115,7 +285,11 @@ int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_consistency),
         cmocka_unit_test(test_helpers),
-        cmocka_unit_test(test_allocation)
+        cmocka_unit_test(test_allocation),
+        cmocka_unit_test(test_tree_deletion),
+		cmocka_unit_test(test_part_tree_deletion),
+		cmocka_unit_test(test_reset),
+		cmocka_unit_test(test_helpers)
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

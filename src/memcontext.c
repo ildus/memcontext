@@ -13,19 +13,12 @@
 
 __thread MemoryContext current_mcxt = NULL;
 
-static inline void
-malloc_free(void *ptr)
-{
-	free(ptr);
-}
-
 /* Append chunk at the end of list of chunks */
 static inline void
 mcxt_append_chunk(MemoryContext context, MemoryChunk chunk)
 {
 	MemoryChunk		lastchunk;
 
-	mm_sleeplock_lock(&context->lock);
 	lastchunk = context->lastchunk;
 	if (lastchunk)
 		lastchunk->next = chunk;
@@ -33,38 +26,42 @@ mcxt_append_chunk(MemoryContext context, MemoryChunk chunk)
 	context->lastchunk = chunk;
 	chunk->prev = lastchunk;
 	chunk->next = NULL;
-	mm_sleeplock_unlock(&context->lock);
+}
+
+static void mcxt_link_context(MemoryContext parent, MemoryContext new)
+{
+	mm_sleeplock_lock(&parent->lock);
+	if (parent->firstchild == NULL)
+		parent->firstchild = new;
+	else
+	{
+		MemoryContext	child;
+		for (child = parent->firstchild; child->nextchild != NULL;
+				child = child->nextchild);
+
+		child->nextchild = new;
+		new->prevchild = child;
+	}
+	mm_sleeplock_unlock(&parent->lock);
 }
 
 /* New memory context */
 MemoryContext mcxt_new(MemoryContext parent)
 {
-	MemoryContext	new = mcxt_alloc_mem(parent,
-		sizeof(struct MemoryContextData), true);
+	MemoryChunk chunk = calloc(MEMORY_CHUNK_SIZE +
+		sizeof(struct MemoryContextData), 1);
+	MemoryContext new = ChunkDataOffset(chunk);
+
 	if (new == NULL)
 		return NULL;
 
 	new->parent = parent;
 	new->ptid = pthread_self();
-	GetMemoryChunk(new)->chunk_type = mct_context;
+	chunk->chunk_type = mct_context;
 
-	/* append to children */
+	/* append to parent's children */
 	if (parent)
-	{
-		mm_sleeplock_lock(&parent->lock);
-		if (parent->firstchild == NULL)
-			parent->firstchild = new;
-		else
-		{
-			MemoryContext	child = parent->firstchild;
-			for (child = parent->firstchild; child->nextchild != NULL;
-					child = child->nextchild);
-
-			child->nextchild = new;
-			new->prevchild = child;
-		}
-		mm_sleeplock_unlock(&parent->lock);
-	}
+		mcxt_link_context(parent, new);
 
 	return new;
 }
@@ -81,17 +78,10 @@ MemoryContext mcxt_switch_to(MemoryContext to)
 int mcxt_reset(MemoryContext context, bool recursive)
 {
 	int				res = 0;
-	MemoryChunk		chunk = context->lastchunk,
-					prev;
+	MemoryChunk		chunk = context->lastchunk;
 
 	if (context->ptid != pthread_self())
 		return MCXT_THREAD_CONFLICT;
-
-	/* we make it look like free */
-	mm_sleeplock_lock(&context->lock);
-	chunk = context->lastchunk;
-	context->lastchunk = NULL;
-	mm_sleeplock_unlock(&context->lock);
 
 	if (recursive)
 	{
@@ -105,17 +95,49 @@ int mcxt_reset(MemoryContext context, bool recursive)
 		}
 	}
 
-	do
+	while (chunk != NULL)
 	{
-		prev = chunk->prev;
-		if (chunk->chunk_type == mct_context)
-			mcxt_append_chunk(context, chunk);
-		else
-			malloc_free(chunk);
+		MemoryChunk prev = chunk->prev;
+		free(chunk);
+		chunk = prev;
 	}
-	while ((chunk = prev) != NULL);
+	context->lastchunk = NULL;
 
 	return res;
+}
+
+int mcxt_chunks_count(MemoryContext context)
+{
+	int			count = 0;
+	MemoryChunk chunk = context->lastchunk;
+	while (chunk != NULL)
+	{
+		count++;
+		chunk = chunk->prev;
+	}
+	return count;
+}
+
+static void mcxt_unlink_context(MemoryContext context)
+{
+	if (context->parent == NULL)
+	{
+		assert(context->prevchild == NULL);
+		assert(context->nextchild == NULL);
+		return;
+	}
+
+	mm_sleeplock_lock(&context->parent->lock);
+
+	if (context->prevchild)
+		context->prevchild->nextchild = context->nextchild;
+	else
+		context->parent->firstchild = context->nextchild;
+
+	if (context->nextchild)
+		context->nextchild->prevchild = context->prevchild;
+
+	mm_sleeplock_unlock(&context->parent->lock);
 }
 
 /* Delete memory context, all its chunks and childs */
@@ -125,17 +147,12 @@ int mcxt_delete(MemoryContext context)
 	MemoryContext	child;
 
 	assert(current_mcxt != context);
+	assert(GetMemoryChunk(context)->chunk_type == mct_context);
 
 	if (context->ptid != pthread_self())
 		return MCXT_THREAD_CONFLICT;
 
-	if (context->prevchild)
-		context->prevchild->nextchild = context->nextchild;
-	else if (context->parent)
-		context->parent->firstchild = context->nextchild;
-
-	if (context->nextchild)
-		context->nextchild->prevchild = context->prevchild;
+	mcxt_unlink_context(context);
 
 	for (child = context->firstchild; child != NULL; child = child->nextchild)
 	{
@@ -144,8 +161,8 @@ int mcxt_delete(MemoryContext context)
 			res = r;
 	}
 
-	mcxt_reset(context, true);
-	mcxt_free_mem(context->parent, (void *) context);
+	mcxt_reset(context, false);
+	free(GetMemoryChunk(context));
 
 	return res;
 }
@@ -155,9 +172,7 @@ void *mcxt_alloc_mem(MemoryContext context, size_t size, bool zero)
 {
 	MemoryChunk		chunk;
 
-	if (context == NULL)
-		return zero ? calloc(size, 1) : malloc(size);
-
+	assert(context);
 	assert(context->ptid == pthread_self());
 
 	chunk = malloc(MEMORY_CHUNK_SIZE + size);
@@ -169,8 +184,8 @@ void *mcxt_alloc_mem(MemoryContext context, size_t size, bool zero)
 
 	chunk->context = context;
 	chunk->chunk_type = mct_alloc;
-
 	mcxt_append_chunk(context, chunk);
+
 	return ChunkDataOffset(chunk);
 }
 
@@ -181,21 +196,15 @@ void mcxt_free_mem(MemoryContext context, void *p)
 
 	assert(p != NULL);
 	assert(p == (void *) MAXALIGN(p));
-	assert(chunk->chunk_type > 0);
+	assert(chunk->chunk_type == mct_alloc);
 
 	/* first, deattach from chunks in context */
 	if (chunk->next)
 		chunk->next->prev = chunk->prev;
-
 	if (chunk->prev)
 		chunk->prev->next = chunk->next;
-
-	if (context && chunk == context->lastchunk)
-	{
-		mm_sleeplock_lock(&context->lock);
+	if (chunk == context->lastchunk)
 		context->lastchunk = chunk->prev;
-		mm_sleeplock_unlock(&context->lock);
-	}
 
-	malloc_free(chunk);
+	free(chunk);
 }
